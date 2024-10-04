@@ -1,0 +1,34 @@
+version: 2.1
+orbs:
+  node: circleci/node@6.1.0
+
+jobs:
+  build_and_test:
+    executor: node/default
+    steps:
+      - checkout
+      - node/install-packages:
+          pkg-manager: yarn
+      - run:
+          command: yarn check
+          name: Run check
+      - run:
+          command: yarn build
+          name: Build app
+  deploy:
+    executor: node/default
+    steps:
+      - run:
+          command: yarn deploy
+          name: Deploy
+
+workflows:
+  test_my_app:
+    jobs:
+      - build_and_test
+      - deploy:
+          requires:
+            - build_and_test # only deploy if the build_and_test job has completed
+          filters:
+            branches:
+              only: main # only deploy when on main
