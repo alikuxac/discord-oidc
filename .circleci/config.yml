@@ -20,10 +20,11 @@ jobs:
           name: Deploy
 
 workflows:
-  test_my_app:
+  test_and_deploy:
     jobs:
       - build_and_test
       - deploy:
+          context: cf-workers
           requires:
             - build_and_test # only deploy if the build_and_test job has completed
           filters:
