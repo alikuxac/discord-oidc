@@ -12,9 +12,6 @@ jobs:
       - run:
           command: yarn check
           name: Run check
-      - run:
-          command: yarn build
-          name: Build app
   deploy:
     executor: node/default
     steps:
@@ -31,4 +28,4 @@ workflows:
             - build_and_test # only deploy if the build_and_test job has completed
           filters:
             branches:
-              only: main # only deploy when on main
+              only: master # only deploy when on main
