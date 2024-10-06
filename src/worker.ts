@@ -1,6 +1,12 @@
 import { Hono } from "hono";
 import { JwtPlugin } from "./plugins/jwk";
 import * as jose from 'jose';
+import {
+	RESTPostOAuth2AccessTokenResult,
+	APIUser,
+	APIGuild,
+	APIGuildMember,
+} from 'discord-api-types/v10';
 
 const jwtPlugin = new JwtPlugin();
 
@@ -64,15 +70,15 @@ app.post('/token', async (c) => {
 		'code': code,
 		'grant_type': 'authorization_code',
 		'scope': 'identify email'
-	}).toString()
+	}).toString();
 
-	const r: Record<string, any> = await fetch('https://discord.com/api/v10/oauth2/token', {
+	const r = await fetch('https://discord.com/api/v10/oauth2/token', {
 		method: 'POST',
 		body: params,
 		headers: {
 			'Content-Type': 'application/x-www-form-urlencoded'
 		}
-	}).then(res => res.json())
+	}).then(res => res.json<RESTPostOAuth2AccessTokenResult>())
 
 	if (r === null) return new Response("Bad request.", { status: 400 })
 
@@ -80,11 +86,11 @@ app.post('/token', async (c) => {
 		headers: {
 			'Authorization': 'Bearer ' + r['access_token'] as string
 		}
-	}).then(res => res.json())
+	}).then(res => res.json<APIUser>())
 
 	if (!userInfo['verified']) return c.text('Bad request.', 400)
 
-	let servers = []
+	let servers: string[] = []
 
 	const serverResp = await fetch('https://discord.com/api/v10/users/@me/guilds', {
 		headers: {
@@ -93,13 +99,15 @@ app.post('/token', async (c) => {
 	})
 
 	if (serverResp.status === 200) {
-		const serverJson: any[] = await serverResp.json()
+		const serverJson = await serverResp.json<APIGuild[]>()
 		servers = serverJson.map(item => {
-			return item['id']
+			return item.id
 		})
 	}
 
-	let roleClaims: any = {}
+	let roleClaims: {
+		[key: string]: string[]
+	} = {}
 
 
 	if (c.env.DISCORD_CLIENT_TOKEN && c.env.SERVER_LIST) {
@@ -112,7 +120,7 @@ app.post('/token', async (c) => {
 				})
 				// i had issues doing this any other way?
 				const memberResp = await memberPromise
-				const memberJson: any = await memberResp.json()
+				const memberJson = await memberResp.json<APIGuildMember>()
 
 				roleClaims[`roles:${guildId}`] = memberJson.roles
 			}
@@ -122,10 +130,6 @@ app.post('/token', async (c) => {
 	}
 
 	let preferred_username = userInfo['username']
-
-	if (userInfo['discriminator'] && userInfo['discriminator'] !== '0') {
-		preferred_username += `#${userInfo['discriminator']}`
-	}
 
 	let displayName = userInfo['global_name'] ?? userInfo['username']
 
@@ -152,7 +156,15 @@ app.post('/token', async (c) => {
 	})
 })
 
-app.get('/jwk.json', async (c) => {
+app.get('/jwks.json', async (c) => {
+	let publicKey = (await jwtPlugin.loadOrGenerateKeyPair(c.env.KV)).publicKey
+	return c.json({
+		keys: [{
+			alg: 'RS256',
+			kid: 'jwtRS256',
+			...(await crypto.subtle.exportKey('jwk', publicKey))
+		}]
+	})
 });
 
 export default app;

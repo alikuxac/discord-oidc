@@ -1,6 +1,6 @@
 {
-	"name": "worker-template",
-	"version": "0.0.1",
+	"name": "discord-oidc",
+	"version": "1.0.1",
 	"type": "module",
 	"private": true,
 	"scripts": {
@@ -10,6 +10,7 @@
 		"lint": "eslint ."
 	},
 	"dependencies": {
+		"discord-api-types": "^0.37.101",
 		"hono": "^4.6.3",
 		"jose": "^5.9.3"
 	},
