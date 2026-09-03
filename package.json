@@ -10,7 +10,7 @@
 		"lint": "eslint ."
 	},
 	"dependencies": {
-		"discord-api-types": "^0.37.119",
+		"discord-api-types": "^0.38.0",
 		"hono": "^4.7.4",
 		"jose": "^6.0.10"
 	},
