@@ -1,7 +1,7 @@
 import { Hono } from "hono";
 import { JwtPlugin } from "./plugins/jwk";
 import { cfAccessMiddleware } from "./plugins/cfAccess";
-import { ServerProvider } from "./types/provider";
+import { BotGroup } from "./types/provider";
 import * as jose from 'jose';
 import {
 	RESTPostOAuth2AccessTokenResult,
@@ -32,29 +32,80 @@ const app = new Hono<{
 app.get("/", (c) => c.text("Discord OIDC Provider Worker is Running."));
 
 /**
- * Helper to fetch provider config by serverId from KV or fallback to ENV.
+ * Helper to fetch BotGroup config by serverId or groupId from KV or fallback to ENV.
  */
-async function getProviderConfig(env: Bindings, serverId?: string): Promise<ServerProvider | null> {
-	if (serverId && env.KV) {
-		const raw = await env.KV.get(`provider:${serverId}`);
-		if (raw) {
-			try {
-				return JSON.parse(raw) as ServerProvider;
-			} catch (e) {
-				console.error(`Failed to parse provider JSON for serverId: ${serverId}`, e);
+async function getBotGroup(env: Bindings, targetId?: string): Promise<{ group: BotGroup; matchedServerId: string } | null> {
+	if (env.KV) {
+		// 1. Direct group lookup if targetId starts with "group:" or exact groupId
+		if (targetId) {
+			const directGroupRaw = await env.KV.get(`group:${targetId}`);
+			if (directGroupRaw) {
+				try {
+					const group = JSON.parse(directGroupRaw) as BotGroup;
+					return { group, matchedServerId: group.serverIds?.[0] || targetId };
+				} catch (e) {
+					console.error(`Failed to parse group JSON for ${targetId}`, e);
+				}
+			}
+		}
+
+		// 2. Scan all groups to find one containing targetId in serverIds
+		const list = await env.KV.list({ prefix: 'group:' });
+		for (const key of list.keys) {
+			const raw = await env.KV.get(key.name);
+			if (raw) {
+				try {
+					const group = JSON.parse(raw) as BotGroup;
+					if (targetId && group.serverIds?.includes(targetId)) {
+						return { group, matchedServerId: targetId };
+					}
+					if (group.groupId === targetId) {
+						return { group, matchedServerId: group.serverIds?.[0] || targetId };
+					}
+				} catch {
+					// Ignore invalid JSON
+				}
+			}
+		}
+
+		// 3. Fallback backward compatibility lookup for old "provider:serverId" keys
+		if (targetId) {
+			const oldProviderRaw = await env.KV.get(`provider:${targetId}`);
+			if (oldProviderRaw) {
+				try {
+					const oldP = JSON.parse(oldProviderRaw);
+					const group: BotGroup = {
+						groupId: oldP.serverId,
+						groupName: oldP.serverName || 'Legacy Provider',
+						clientId: oldP.clientId,
+						clientSecret: oldP.clientSecret,
+						botToken: oldP.botToken || '',
+						redirectUri: oldP.redirectUri || '',
+						serverIds: [oldP.serverId],
+					};
+					return { group, matchedServerId: targetId };
+				} catch {
+					// Ignore invalid legacy provider format
+				}
 			}
 		}
 	}
 
-	// Fallback to static env configuration if available
+	// 4. Fallback to static env configuration if available
 	if (env.DISCORD_CLIENT_ID && env.DISCORD_CLIENT_SECRET) {
+		const staticServerList = env.SERVER_LIST ? env.SERVER_LIST.split(',') : [];
+		const fallbackServerId = targetId || staticServerList[0] || 'default';
 		return {
-			serverId: serverId || env.SERVER_LIST || 'default',
-			serverName: 'Default Server',
-			clientId: env.DISCORD_CLIENT_ID,
-			clientSecret: env.DISCORD_CLIENT_SECRET,
-			botToken: env.DISCORD_CLIENT_TOKEN || '',
-			redirectUri: env.DISCORD_REDIRECT_URI || '',
+			group: {
+				groupId: 'default',
+				groupName: 'Default Environment Group',
+				clientId: env.DISCORD_CLIENT_ID,
+				clientSecret: env.DISCORD_CLIENT_SECRET,
+				botToken: env.DISCORD_CLIENT_TOKEN || '',
+				redirectUri: env.DISCORD_REDIRECT_URI || '',
+				serverIds: staticServerList.length > 0 ? staticServerList : [fallbackServerId],
+			},
+			matchedServerId: fallbackServerId,
 		};
 	}
 
@@ -64,7 +115,7 @@ async function getProviderConfig(env: Bindings, serverId?: string): Promise<Serv
 // OAuth Authorize Route
 app.get('/authorize/:scopemode', async (c) => {
 	const { scopemode } = c.req.param();
-	const { redirect_uri, state, server_id } = c.req.query();
+	const { redirect_uri, state, server_id, group_id } = c.req.query();
 
 	const scopeMode = {
 		email: 'identify email',
@@ -76,23 +127,24 @@ app.get('/authorize/:scopemode', async (c) => {
 		return c.text('Invalid scope mode', 400);
 	}
 
-	// Resolve provider config either by requested server_id or client_id
-	const targetServerId = server_id || (c.req.query('server') as string);
-	const provider = await getProviderConfig(c.env, targetServerId);
+	const targetId = server_id || group_id || (c.req.query('server') as string);
+	const resolved = await getBotGroup(c.env, targetId);
 
-	if (!provider) {
-		return c.text('Provider configuration not found for requested server', 404);
+	if (!resolved) {
+		return c.text('Bot Group or Server Provider configuration not found', 404);
 	}
 
-	// Dynamic OAuth parameters
+	const { group, matchedServerId } = resolved;
+
 	const params = new URLSearchParams({
-		client_id: provider.clientId,
-		redirect_uri: redirect_uri || provider.redirectUri,
+		client_id: group.clientId,
+		redirect_uri: redirect_uri || group.redirectUri,
 		response_type: 'code',
 		scope: scopeMode[scopemode as keyof typeof scopeMode],
 		state: JSON.stringify({
 			originalState: state || '',
-			serverId: provider.serverId,
+			groupId: group.groupId,
+			serverId: matchedServerId,
 		}),
 		prompt: 'none',
 	}).toString();
@@ -107,25 +159,31 @@ app.post('/token', async (c) => {
 	const stateRaw = body['state'] as string;
 
 	let serverId = body['server_id'] as string;
+	let groupId = body['group_id'] as string;
 
 	if (stateRaw) {
 		try {
 			const parsedState = JSON.parse(stateRaw);
 			serverId = parsedState.serverId || serverId;
+			groupId = parsedState.groupId || groupId;
 		} catch {
-			// Not a JSON state string, ignore
+			// Ignore non-JSON state
 		}
 	}
 
-	const provider = await getProviderConfig(c.env, serverId);
-	if (!provider) {
-		return c.text('Provider credentials not found', 400);
+	const targetId = serverId || groupId;
+	const resolved = await getBotGroup(c.env, targetId);
+	if (!resolved) {
+		return c.text('Bot Group credentials not found', 400);
 	}
 
+	const { group } = resolved;
+	const targetServerId = serverId || resolved.matchedServerId;
+
 	const params = new URLSearchParams({
-		client_id: provider.clientId,
-		client_secret: provider.clientSecret,
-		redirect_uri: body['redirect_uri'] as string || provider.redirectUri,
+		client_id: group.clientId,
+		client_secret: group.clientSecret,
+		redirect_uri: (body['redirect_uri'] as string) || group.redirectUri,
 		code: code,
 		grant_type: 'authorization_code',
 		scope: 'identify email',
@@ -165,20 +223,20 @@ app.post('/token', async (c) => {
 
 	const roleClaims: { [key: string]: string[] } = {};
 
-	// Fetch roles specifically for the provider's bound server using its Bot Token
-	if (provider.botToken && provider.serverId) {
-		if (servers.includes(provider.serverId)) {
+	// Query roles for the target server if the bot token is provided
+	if (group.botToken && targetServerId) {
+		if (servers.includes(targetServerId)) {
 			const memberResp = await fetch(
-				`https://discord.com/api/v10/guilds/${provider.serverId}/members/${userInfo['id']}`,
+				`https://discord.com/api/v10/guilds/${targetServerId}/members/${userInfo['id']}`,
 				{
 					headers: {
-						Authorization: 'Bot ' + provider.botToken,
+						Authorization: 'Bot ' + group.botToken,
 					},
 				}
 			);
 			if (memberResp.ok) {
 				const memberJson = await memberResp.json<APIGuildMember>();
-				roleClaims[`roles:${provider.serverId}`] = memberJson.roles;
+				roleClaims[`roles:${targetServerId}`] = memberJson.roles;
 			}
 		}
 	}
@@ -188,7 +246,7 @@ app.post('/token', async (c) => {
 
 	const idToken = await new jose.SignJWT({
 		iss: 'https://cloudflare.com',
-		aud: provider.clientId,
+		aud: group.clientId,
 		preferred_username,
 		...userInfo,
 		...roleClaims,
@@ -196,11 +254,12 @@ app.post('/token', async (c) => {
 		global_name: userInfo['global_name'],
 		name: displayName,
 		guilds: servers,
-		server_id: provider.serverId,
+		group_id: group.groupId,
+		server_id: targetServerId,
 	})
 		.setProtectedHeader({ alg: 'RS256' })
 		.setExpirationTime('1h')
-		.setAudience(provider.clientId)
+		.setAudience(group.clientId)
 		.sign((await jwtPlugin.loadOrGenerateKeyPair(c.env.KV)).privateKey);
 
 	return c.json({
@@ -224,69 +283,75 @@ app.get('/jwks.json', async (c) => {
 });
 
 // ==========================================
-// ADMIN DASHBOARD & API (CF ACCESS PROTECTED)
+// ADMIN DASHBOARD & REST API (CF ACCESS PROTECTED)
 // ==========================================
 
 const adminApp = new Hono<{ Bindings: Bindings }>();
 adminApp.use('*', cfAccessMiddleware);
 
-// Admin REST API: List Providers
-adminApp.get('/api/providers', async (c) => {
+// Admin REST API: List Groups
+adminApp.get('/api/groups', async (c) => {
 	if (!c.env.KV) return c.json({ error: 'KV Namespace not configured' }, 500);
 
-	const list = await c.env.KV.list({ prefix: 'provider:' });
-	const providers: ServerProvider[] = [];
+	const list = await c.env.KV.list({ prefix: 'group:' });
+	const groups: BotGroup[] = [];
 
 	for (const key of list.keys) {
 		const raw = await c.env.KV.get(key.name);
 		if (raw) {
 			try {
-				providers.push(JSON.parse(raw));
+				groups.push(JSON.parse(raw));
 			} catch {
-				// Ignore parse errors
+				// Ignore JSON errors
 			}
 		}
 	}
 
-	return c.json(providers);
+	return c.json(groups);
 });
 
-// Admin REST API: Save/Update Provider
-adminApp.post('/api/providers', async (c) => {
+// Admin REST API: Save/Update Group
+adminApp.post('/api/groups', async (c) => {
 	if (!c.env.KV) return c.json({ error: 'KV Namespace not configured' }, 500);
 
-	const body = await c.req.json<ServerProvider>();
+	const body = await c.req.json<BotGroup>();
 
-	if (!body.serverId || !body.clientId || !body.clientSecret) {
-		return c.json({ error: 'Missing required fields: serverId, clientId, clientSecret' }, 400);
+	if (!body.groupId || !body.clientId || !body.clientSecret) {
+		return c.json({ error: 'Missing required fields: groupId, clientId, clientSecret' }, 400);
 	}
 
 	const now = new Date().toISOString();
-	const existingRaw = await c.env.KV.get(`provider:${body.serverId}`);
+	const existingRaw = await c.env.KV.get(`group:${body.groupId}`);
 	const existing = existingRaw ? JSON.parse(existingRaw) : {};
 
-	const provider: ServerProvider = {
-		serverId: body.serverId,
-		serverName: body.serverName || existing.serverName || 'Discord Server',
-		clientId: body.clientId,
-		clientSecret: body.clientSecret,
-		botToken: body.botToken || '',
-		redirectUri: body.redirectUri || '',
+	// Clean & deduplicate serverIds
+	const serverIds = Array.isArray(body.serverIds)
+		? [...new Set(body.serverIds.map((id) => id.trim()).filter(Boolean))]
+		: existing.serverIds || [];
+
+	const group: BotGroup = {
+		groupId: body.groupId.trim(),
+		groupName: body.groupName || existing.groupName || 'Bot Group',
+		clientId: body.clientId.trim(),
+		clientSecret: body.clientSecret.trim(),
+		botToken: body.botToken ? body.botToken.trim() : existing.botToken || '',
+		redirectUri: body.redirectUri ? body.redirectUri.trim() : existing.redirectUri || '',
+		serverIds,
 		createdAt: existing.createdAt || now,
 		updatedAt: now,
 	};
 
-	await c.env.KV.put(`provider:${body.serverId}`, JSON.stringify(provider));
-	return c.json({ success: true, provider });
+	await c.env.KV.put(`group:${group.groupId}`, JSON.stringify(group));
+	return c.json({ success: true, group });
 });
 
-// Admin REST API: Delete Provider
-adminApp.delete('/api/providers/:serverId', async (c) => {
+// Admin REST API: Delete Group
+adminApp.delete('/api/groups/:groupId', async (c) => {
 	if (!c.env.KV) return c.json({ error: 'KV Namespace not configured' }, 500);
-	const { serverId } = c.req.param();
+	const { groupId } = c.req.param();
 
-	await c.env.KV.delete(`provider:${serverId}`);
-	return c.json({ success: true, message: `Provider for server ${serverId} deleted.` });
+	await c.env.KV.delete(`group:${groupId}`);
+	return c.json({ success: true, message: `Group ${groupId} deleted.` });
 });
 
 // Admin Dashboard UI (Embedded Single Page App)
@@ -295,131 +360,204 @@ adminApp.get('/', (c) => {
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <title>Discord OIDC Multi-Tenant Admin</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Discord OIDC - Bot Groups Manager</title>
   <script src="https://cdn.tailwindcss.com"></script>
 </head>
-<body class="bg-slate-900 text-slate-100 min-h-screen p-8 font-sans">
-  <div class="max-w-5xl mx-auto">
-    <div class="flex justify-between items-center mb-8 border-b border-slate-700 pb-4">
+<body class="bg-slate-950 text-slate-100 min-h-screen p-6 font-sans">
+  <div class="max-w-6xl mx-auto">
+    <!-- Header -->
+    <div class="flex flex-col md:flex-row justify-between items-start md:items-center mb-8 pb-4 border-b border-slate-800 gap-4">
       <div>
-        <h1 class="text-2xl font-bold text-indigo-400">Discord OIDC Providers (1:1 Multi-Tenant)</h1>
-        <p class="text-slate-400 text-sm">Protected by Cloudflare Access Gateway</p>
+        <h1 class="text-2xl font-bold text-indigo-400 flex items-center gap-2">
+          <span>🤖</span> Discord Bot Groups Manager
+        </h1>
+        <p class="text-slate-400 text-sm mt-1">Multi-Tenant 1 Bot Group ──► Multi-Server Mapping (Protected by Cloudflare Access)</p>
       </div>
-      <button onclick="openModal()" class="bg-indigo-600 hover:bg-indigo-500 text-white px-4 py-2 rounded-lg font-medium transition shadow">
-        + Add New Server Provider
+      <button onclick="openModal()" class="bg-indigo-600 hover:bg-indigo-500 text-white px-5 py-2.5 rounded-xl font-medium transition shadow-lg shadow-indigo-600/20 flex items-center gap-2">
+        <span>+</span> Add Bot Group
       </button>
     </div>
 
-    <!-- Provider List Table -->
-    <div class="bg-slate-800 rounded-xl shadow overflow-hidden border border-slate-700">
-      <table class="w-full text-left text-sm text-slate-300">
-        <thead class="bg-slate-950/50 text-slate-400 uppercase text-xs">
-          <tr>
-            <th class="p-4">Server Name / ID</th>
-            <th class="p-4">Client ID</th>
-            <th class="p-4">Bot Token Configured</th>
-            <th class="p-4">Redirect URI</th>
-            <th class="p-4 text-right">Actions</th>
-          </tr>
-        </thead>
-        <tbody id="provider-table" class="divide-y divide-slate-700">
-          <tr><td colspan="5" class="p-4 text-center text-slate-500">Loading providers...</td></tr>
-        </tbody>
-      </table>
+    <!-- Groups Container -->
+    <div id="groups-container" class="grid grid-cols-1 md:grid-cols-2 gap-6">
+      <div class="col-span-full text-center py-12 text-slate-500">Loading Bot Groups...</div>
     </div>
   </div>
 
-  <!-- Modal -->
-  <div id="modal" class="fixed inset-0 bg-black/70 hidden flex items-center justify-center p-4">
-    <div class="bg-slate-800 border border-slate-700 rounded-xl p-6 max-w-md w-full shadow-2xl">
-      <h2 id="modal-title" class="text-xl font-bold mb-4 text-indigo-400">Add Server Provider</h2>
-      <form id="provider-form" onsubmit="saveProvider(event)" class="space-y-4 text-sm">
+  <!-- Group Modal -->
+  <div id="modal" class="fixed inset-0 bg-black/80 backdrop-blur-sm hidden flex items-center justify-center p-4 z-50">
+    <div class="bg-slate-900 border border-slate-800 rounded-2xl p-6 max-w-lg w-full shadow-2xl">
+      <div class="flex justify-between items-center mb-6">
+        <h2 id="modal-title" class="text-xl font-bold text-indigo-400">Add Bot Group</h2>
+        <button onclick="closeModal()" class="text-slate-400 hover:text-white text-xl">&times;</button>
+      </div>
+      <form id="group-form" onsubmit="saveGroup(event)" class="space-y-4 text-sm">
         <div>
-          <label class="block text-slate-400 mb-1">Server ID (Discord Guild ID)</label>
-          <input type="text" id="serverId" required class="w-full bg-slate-900 border border-slate-700 rounded p-2 text-white focus:outline-none focus:border-indigo-500">
+          <label class="block text-slate-400 mb-1 font-medium">Group ID (Unique Slug)</label>
+          <input type="text" id="groupId" required placeholder="e.g. vortexia-network" class="w-full bg-slate-950 border border-slate-800 rounded-xl p-3 text-white focus:outline-none focus:border-indigo-500">
         </div>
         <div>
-          <label class="block text-slate-400 mb-1">Server Name (Optional)</label>
-          <input type="text" id="serverName" placeholder="My Survival Server" class="w-full bg-slate-900 border border-slate-700 rounded p-2 text-white focus:outline-none focus:border-indigo-500">
+          <label class="block text-slate-400 mb-1 font-medium">Group Name</label>
+          <input type="text" id="groupName" required placeholder="e.g. Vortexia Minecraft Cluster" class="w-full bg-slate-950 border border-slate-800 rounded-xl p-3 text-white focus:outline-none focus:border-indigo-500">
+        </div>
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+          <div>
+            <label class="block text-slate-400 mb-1 font-medium">Discord Client ID</label>
+            <input type="text" id="clientId" required placeholder="123456789..." class="w-full bg-slate-950 border border-slate-800 rounded-xl p-3 text-white focus:outline-none focus:border-indigo-500 font-mono text-xs">
+          </div>
+          <div>
+            <label class="block text-slate-400 mb-1 font-medium">Discord Client Secret</label>
+            <input type="password" id="clientSecret" required placeholder="••••••••" class="w-full bg-slate-950 border border-slate-800 rounded-xl p-3 text-white focus:outline-none focus:border-indigo-500 font-mono text-xs">
+          </div>
         </div>
         <div>
-          <label class="block text-slate-400 mb-1">Discord Client ID</label>
-          <input type="text" id="clientId" required class="w-full bg-slate-900 border border-slate-700 rounded p-2 text-white focus:outline-none focus:border-indigo-500">
+          <label class="block text-slate-400 mb-1 font-medium">Discord Bot Token (Shared)</label>
+          <input type="password" id="botToken" placeholder="Bot MTIz..." class="w-full bg-slate-950 border border-slate-800 rounded-xl p-3 text-white focus:outline-none focus:border-indigo-500 font-mono text-xs">
         </div>
         <div>
-          <label class="block text-slate-400 mb-1">Discord Client Secret</label>
-          <input type="password" id="clientSecret" required class="w-full bg-slate-900 border border-slate-700 rounded p-2 text-white focus:outline-none focus:border-indigo-500">
+          <label class="block text-slate-400 mb-1 font-medium">Redirect URI</label>
+          <input type="text" id="redirectUri" placeholder="https://auth.domain.com/token" class="w-full bg-slate-950 border border-slate-800 rounded-xl p-3 text-white focus:outline-none focus:border-indigo-500 font-mono text-xs">
         </div>
         <div>
-          <label class="block text-slate-400 mb-1">Discord Bot Token</label>
-          <input type="password" id="botToken" placeholder="Bot MTIz..." class="w-full bg-slate-900 border border-slate-700 rounded p-2 text-white focus:outline-none focus:border-indigo-500">
+          <label class="block text-slate-400 mb-1 font-medium">Bound Server IDs (Comma separated)</label>
+          <textarea id="serverIds" rows="2" placeholder="112233445566778899, 998877665544332211" class="w-full bg-slate-950 border border-slate-800 rounded-xl p-3 text-white focus:outline-none focus:border-indigo-500 font-mono text-xs"></textarea>
+          <p class="text-xs text-slate-500 mt-1">Nhiều Server ID phân cách bằng dấu phẩy (,)</p>
         </div>
-        <div>
-          <label class="block text-slate-400 mb-1">Redirect URI</label>
-          <input type="text" id="redirectUri" placeholder="https://..." class="w-full bg-slate-900 border border-slate-700 rounded p-2 text-white focus:outline-none focus:border-indigo-500">
-        </div>
-        <div class="flex justify-end gap-3 pt-4">
-          <button type="button" onclick="closeModal()" class="px-4 py-2 bg-slate-700 hover:bg-slate-600 rounded text-slate-200">Cancel</button>
-          <button type="submit" class="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 rounded text-white font-medium">Save Provider</button>
+        <div class="flex justify-end gap-3 pt-4 border-t border-slate-800">
+          <button type="button" onclick="closeModal()" class="px-4 py-2 bg-slate-800 hover:bg-slate-700 rounded-xl text-slate-300 font-medium">Cancel</button>
+          <button type="submit" class="px-5 py-2 bg-indigo-600 hover:bg-indigo-500 rounded-xl text-white font-medium shadow-lg shadow-indigo-600/20">Save Group</button>
         </div>
       </form>
     </div>
   </div>
 
   <script>
-    async function loadProviders() {
-      const res = await fetch('/admin/api/providers');
-      const data = await res.json();
-      const tbody = document.getElementById('provider-table');
-      if (!data.length) {
-        tbody.innerHTML = '<tr><td colspan="5" class="p-4 text-center text-slate-500">No providers configured yet.</td></tr>';
+    let rawGroups = [];
+
+    async function loadGroups() {
+      const res = await fetch('/admin/api/groups');
+      rawGroups = await res.json();
+      const container = document.getElementById('groups-container');
+      
+      if (!rawGroups.length) {
+        container.innerHTML = \`<div class="col-span-full bg-slate-900 border border-slate-800 rounded-2xl p-12 text-center text-slate-500">
+          Chưa có Bot Group nào. Bấm <b>+ Add Bot Group</b> để tạo mới.
+        </div>\`;
         return;
       }
-      tbody.innerHTML = data.map(p => \`
-        <tr class="hover:bg-slate-750">
-          <td class="p-4 font-medium text-white">\${p.serverName}<br><span class="text-xs text-slate-400">\${p.serverId}</span></td>
-          <td class="p-4 font-mono text-xs text-indigo-300">\${p.clientId}</td>
-          <td class="p-4">\${p.botToken ? '<span class="text-emerald-400">Yes</span>' : '<span class="text-amber-400">No</span>'}</td>
-          <td class="p-4 text-xs text-slate-400">\${p.redirectUri || 'Default'}</td>
-          <td class="p-4 text-right">
-            <button onclick="deleteProvider('\${p.serverId}')" class="text-rose-400 hover:text-rose-300 font-medium">Delete</button>
-          </td>
-        </tr>
+
+      container.innerHTML = rawGroups.map(g => \`
+        <div class="bg-slate-900 border border-slate-800 rounded-2xl p-6 shadow-xl flex flex-col justify-between space-y-4 hover:border-slate-700 transition">
+          <div>
+            <div class="flex justify-between items-start">
+              <div>
+                <h3 class="text-lg font-bold text-white flex items-center gap-2">\${g.groupName}</h3>
+                <span class="text-xs font-mono text-indigo-400 bg-indigo-950/60 border border-indigo-800/50 px-2 py-0.5 rounded-md mt-1 inline-block">ID: \${g.groupId}</span>
+              </div>
+              <span class="text-xs font-medium px-2.5 py-1 rounded-full \${g.botToken ? 'bg-emerald-950/80 text-emerald-400 border border-emerald-800/50' : 'bg-amber-950/80 text-amber-400 border border-amber-800/50'}">
+                \${g.botToken ? '✓ Bot Token Active' : '⚠ No Bot Token'}
+              </span>
+            </div>
+
+            <div class="mt-4 space-y-2 text-xs text-slate-400">
+              <div class="flex justify-between border-b border-slate-800/60 pb-1.5">
+                <span>Client ID:</span>
+                <span class="font-mono text-slate-200">\${g.clientId}</span>
+              </div>
+              <div class="flex justify-between border-b border-slate-800/60 pb-1.5">
+                <span>Redirect URI:</span>
+                <span class="font-mono text-slate-200 truncate max-w-[200px]">\${g.redirectUri || 'Default'}</span>
+              </div>
+            </div>
+
+            <!-- Server IDs Badges -->
+            <div class="mt-4">
+              <label class="block text-xs font-medium text-slate-400 mb-2">Bound Server IDs (\${g.serverIds?.length || 0}):</label>
+              <div class="flex flex-wrap gap-1.5 max-h-24 overflow-y-auto pr-1">
+                \${(g.serverIds && g.serverIds.length) ? g.serverIds.map(sid => \`
+                  <span class="bg-slate-950 border border-slate-800 text-slate-300 font-mono text-[11px] px-2 py-0.5 rounded-md shadow-sm">\${sid}</span>
+                \`).join('') : '<span class="text-slate-600 text-xs italic">No servers bound</span>'}
+              </div>
+            </div>
+          </div>
+
+          <!-- Actions -->
+          <div class="flex justify-end gap-2 pt-4 border-t border-slate-800/80 text-xs font-medium">
+            <button onclick="editGroup('\${g.groupId}')" class="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-indigo-300 rounded-lg transition">Edit</button>
+            <button onclick="duplicateGroup('\${g.groupId}')" class="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-emerald-300 rounded-lg transition">Duplicate</button>
+            <button onclick="deleteGroup('\${g.groupId}')" class="px-3 py-1.5 bg-rose-950/40 hover:bg-rose-900/60 text-rose-400 border border-rose-900/50 rounded-lg transition">Delete</button>
+          </div>
+        </div>
       \`).join('');
     }
 
-    function openModal() {
-      document.getElementById('provider-form').reset();
+    function openModal(title = 'Add Bot Group') {
+      document.getElementById('modal-title').innerText = title;
+      document.getElementById('group-form').reset();
+      document.getElementById('groupId').disabled = false;
       document.getElementById('modal').classList.remove('hidden');
     }
     function closeModal() { document.getElementById('modal').classList.add('hidden'); }
 
-    async function saveProvider(e) {
+    function editGroup(groupId) {
+      const g = rawGroups.find(item => item.groupId === groupId);
+      if (!g) return;
+      openModal('Edit Bot Group');
+      document.getElementById('groupId').value = g.groupId;
+      document.getElementById('groupId').disabled = true;
+      document.getElementById('groupName').value = g.groupName || '';
+      document.getElementById('clientId').value = g.clientId || '';
+      document.getElementById('clientSecret').value = g.clientSecret || '';
+      document.getElementById('botToken').value = g.botToken || '';
+      document.getElementById('redirectUri').value = g.redirectUri || '';
+      document.getElementById('serverIds').value = (g.serverIds || []).join(', ');
+    }
+
+    function duplicateGroup(groupId) {
+      const g = rawGroups.find(item => item.groupId === groupId);
+      if (!g) return;
+      openModal('Duplicate Bot Group');
+      document.getElementById('groupId').value = g.groupId + '-copy';
+      document.getElementById('groupName').value = (g.groupName || '') + ' (Copy)';
+      document.getElementById('clientId').value = g.clientId || '';
+      document.getElementById('clientSecret').value = g.clientSecret || '';
+      document.getElementById('botToken').value = g.botToken || '';
+      document.getElementById('redirectUri').value = g.redirectUri || '';
+      document.getElementById('serverIds').value = (g.serverIds || []).join(', ');
+    }
+
+    async function saveGroup(e) {
       e.preventDefault();
+      const rawServers = document.getElementById('serverIds').value;
+      const serverIds = rawServers.split(',').map(s => s.trim()).filter(Boolean);
+
       const payload = {
-        serverId: document.getElementById('serverId').value,
-        serverName: document.getElementById('serverName').value,
+        groupId: document.getElementById('groupId').value,
+        groupName: document.getElementById('groupName').value,
         clientId: document.getElementById('clientId').value,
         clientSecret: document.getElementById('clientSecret').value,
         botToken: document.getElementById('botToken').value,
         redirectUri: document.getElementById('redirectUri').value,
+        serverIds: serverIds,
       };
-      await fetch('/admin/api/providers', {
+
+      await fetch('/admin/api/groups', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload)
       });
       closeModal();
-      loadProviders();
+      loadGroups();
     }
 
-    async function deleteProvider(serverId) {
-      if (!confirm('Are you sure you want to delete this provider?')) return;
-      await fetch('/admin/api/providers/' + serverId, { method: 'DELETE' });
-      loadProviders();
+    async function deleteGroup(groupId) {
+      if (!confirm(\`Are you sure you want to delete group "\${groupId}"?\`)) return;
+      await fetch('/admin/api/groups/' + groupId, { method: 'DELETE' });
+      loadGroups();
     }
 
-    loadProviders();
+    loadGroups();
   </script>
 </body>
 </html>`;
