@@ -1058,9 +1058,9 @@ detect-libc@^2.1.2:
   integrity sha512-Btj2BOOO83o3WyH59e8MgXsxEQVcarkUOpEYrubB0urwnN10yQ364rsiByU11nZlqWYZm05i/of7io4mzihBtQ==
 
 discord-api-types@^0.38.55:
-  version "0.38.55"
-  resolved "https://registry.yarnpkg.com/discord-api-types/-/discord-api-types-0.38.55.tgz#a3f247414e3dd1294a6e2c89fe1ff65b1f421bc3"
-  integrity sha512-ytuaRTzdnHUCXJ6KjL9MrItQX0xKncBKEeYI1Bst4+ud47eejH3cG6gaesYakjpPcUhh68XYS2YwGq3mmujFsA==
+  version "0.38.57"
+  resolved "https://registry.yarnpkg.com/discord-api-types/-/discord-api-types-0.38.57.tgz#f9ab83136401e284079462ac0c6b5c6509efeb6e"
+  integrity sha512-R1CTSSt4RshqCq23j2Xq2ZscvzB4LzG9OB1CYQdKUGdw8Ti/oF/72EEtK2mNpagG/Vj9NcBT7dw9lKLf+Dacfg==
 
 doctrine@^3.0.0:
   version "3.0.0"
